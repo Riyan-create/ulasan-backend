@@ -1,0 +1,25 @@
+{
+  "name": "ulasin-backend",
+  "version": "1.1.0",
+  "description": "Backend redirect + aktivasi untuk kartu review NFC/QR",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "generate-cards": "node scripts/generate-cards.js",
+    "backup-db": "node scripts/backup-db.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "bcrypt": "^5.1.1",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^7.1.0",
+    "morgan": "^1.10.0",
+    "nodemailer": "^6.9.14",
+    "qrcode": "^1.5.4"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
