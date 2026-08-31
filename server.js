@@ -28,7 +28,8 @@ const BASE_URL = (process.env.BASE_URL || "http://localhost:3000").replace(/\/$/
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
 const FORCE_HTTPS = process.env.FORCE_HTTPS === "true";
 
-const db = new Database(path.join(__dirname, "ulasin.db"));
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, "ulasin.db");
+const db = new Database(DB_PATH);
 db.exec(fs.readFileSync(path.join(__dirname, "schema.sql"), "utf8"));
 
 // ---------- Email (untuk pemulihan PIN) ----------
@@ -120,8 +121,6 @@ async function verifyPin(cardId, pin) {
   return match ? { ok: true } : { ok: false, reason: "PIN salah" };
 }
 
-// MODE MANUAL (tanpa Google Places API): nama bisnis dan link review diisi
-// sendiri oleh pemilik kartu, bukan hasil pencarian otomatis.
 function sanitizeBusinessName(name) {
   if (!name || typeof name !== "string") return null;
   const trimmed = name.trim().replace(/[\r\n\t]+/g, " ");
@@ -300,13 +299,32 @@ app.get("/api/cards/:id", (req, res) => {
   res.json({ ok: true, card: safeCard(card) });
 });
 
-// ================= ADMIN (lihat semua kartu) =================
+// ================= ADMIN (lihat semua kartu & buat kartu baru) =================
+function checkAdmin(req) {
+  const key = req.headers["x-admin-key"] || req.query.key;
+  return ADMIN_API_KEY && key === ADMIN_API_KEY;
+}
+
+const ID_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+function randomCardId(len = 6) {
+  return Array.from(crypto.randomBytes(len))
+    .map((b) => ID_ALPHABET[b % ID_ALPHABET.length])
+    .join("");
+}
+
 app.get("/api/admin/cards", (req, res) => {
-  if (!ADMIN_API_KEY || req.headers["x-admin-key"] !== ADMIN_API_KEY) {
-    return res.status(401).json({ ok: false, error: "Tidak diizinkan" });
-  }
+  if (!checkAdmin(req)) return res.status(401).json({ ok: false, error: "Tidak diizinkan" });
   const rows = db.prepare("SELECT * FROM cards ORDER BY created_at DESC").all();
   res.json({ ok: true, cards: rows.map(safeCard) });
+});
+
+app.get("/api/admin/create-card", (req, res) => {
+  if (!checkAdmin(req)) return res.status(401).json({ ok: false, error: "Tidak diizinkan" });
+  const exists = db.prepare("SELECT 1 FROM cards WHERE id = ?");
+  let id;
+  do { id = randomCardId(); } while (exists.get(id));
+  db.prepare("INSERT INTO cards (id, status) VALUES (?, 'inactive')").run(id);
+  res.json({ ok: true, id, activationUrl: `${BASE_URL}/k/${id}` });
 });
 
 app.listen(PORT, () => {
