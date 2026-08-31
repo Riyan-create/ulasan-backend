@@ -1,7 +1,7 @@
-// manage.js — dipakai untuk /aktivasi/:id maupun /kelola/:id
-// Semua data diambil/dikirim lewat fetch() ke backend. Nama bisnis yang ditampilkan
-// SELALU datang dari respons server (yang sudah diverifikasi ke Google), bukan dari
-// input pengguna secara langsung — dan semua teks dinamis di-escape sebelum dirender.
+      // manage.js — dipakai untuk /aktivasi/:id maupun /kelola/:id
+// Semua data diambil/dikirim lewat fetch() ke backend. Nama bisnis dan link
+// review diisi manual oleh pemilik kartu (tanpa Google Places API), dan
+// semua teks dinamis di-escape sebelum dirender untuk mencegah XSS.
 
 const app = document.getElementById("app");
 const cardId = window.location.pathname.split("/").filter(Boolean).pop();
@@ -14,9 +14,8 @@ function escapeHtml(str) {
 
 const state = {
   card: null,
-  query: "",
-  results: [],
-  picked: null,   // { description, placeId } — hanya dari hasil autocomplete, tidak pernah teks bebas
+  businessName: "",
+  reviewLink: "",
   email: "",
   pin: "",
   pinConfirm: "",
@@ -71,37 +70,6 @@ function bindPinPad(container, getValue, setValue, onComplete, max = 4) {
   });
 }
 
-function bindAutocomplete(inputEl, resultsEl, onPick) {
-  let debounceTimer;
-  inputEl.addEventListener("input", (e) => {
-    state.query = e.target.value;
-    state.picked = null;
-    clearTimeout(debounceTimer);
-    if (state.query.length < 2) { resultsEl.style.display = "none"; return; }
-    debounceTimer = setTimeout(async () => {
-      try {
-        const data = await api(`/api/places/autocomplete?q=${encodeURIComponent(state.query)}`);
-        state.results = data.predictions || [];
-        resultsEl.style.display = state.results.length ? "block" : "none";
-        resultsEl.innerHTML = state.results
-          .map((r, i) => `<div class="autocomplete-item" data-i="${i}">${escapeHtml(r.description)}</div>`)
-          .join("");
-        resultsEl.querySelectorAll(".autocomplete-item").forEach((el) => {
-          el.addEventListener("click", () => {
-            const picked = state.results[Number(el.dataset.i)];
-            state.picked = picked;
-            state.query = picked.description;
-            resultsEl.style.display = "none";
-            onPick(picked);
-          });
-        });
-      } catch (e) {
-        resultsEl.style.display = "none";
-      }
-    }, 300);
-  });
-}
-
 // ---------- Render ----------
 function render() {
   if (state.mode === "loading") {
@@ -122,41 +90,34 @@ function render() {
       <p class="card-id">#${escapeHtml(cardId)}</p>
       <div class="step-dots"><span class="step-dot done"></span><span class="step-dot"></span><span class="step-dot"></span></div>
       <h1>Kartu belum aktif</h1>
-      <p class="sub">Cari nama bisnis kamu di Google.</p>
-      <div class="search-box"><input id="q" placeholder="Ketik nama bisnis…" autofocus value="${escapeHtml(state.query)}" /></div>
-      <div id="results" class="autocomplete-list" style="display:none"></div>
+      <p class="sub">Isi nama bisnis kamu dan link review Google-nya.</p>
+      ${state.error ? `<div class="error-text">${escapeHtml(state.error)}</div>` : ""}
+      <div class="search-box" style="margin-bottom:10px"><input id="name" placeholder="Nama bisnis" autofocus value="${escapeHtml(state.businessName)}" /></div>
+      <div class="search-box"><input id="link" placeholder="Link review Google (https://...)" value="${escapeHtml(state.reviewLink)}" /></div>
+      <p class="footnote" style="margin-top:10px;text-align:left">
+        Belum punya link-nya? Buka Google Maps, cari bisnis kamu, tekan "Share"/Bagikan.
+        Atau lewat business.google.com &gt; menu "Get more reviews" untuk link yang langsung buka kotak bintang.
+      </p>
+      <button class="btn-primary" id="next" style="margin-top:14px">Lanjut</button>
     `;
-    bindAutocomplete(document.getElementById("q"), document.getElementById("results"), () => {
-      state.mode = "activate-confirm";
+    document.getElementById("next").addEventListener("click", () => {
+      const name = document.getElementById("name").value.trim();
+      const link = document.getElementById("link").value.trim();
+      if (name.length < 2) { state.error = "Nama bisnis minimal 2 karakter"; render(); return; }
+      if (!/^https:\/\//.test(link)) { state.error = "Link harus diawali https://"; render(); return; }
+      state.businessName = name;
+      state.reviewLink = link;
+      state.error = "";
+      state.mode = "activate-email";
       render();
     });
-    return;
-  }
-
-  if (state.mode === "activate-confirm") {
-    app.innerHTML = `
-      <p class="card-id">#${escapeHtml(cardId)}</p>
-      <div class="step-dots"><span class="step-dot done"></span><span class="step-dot done"></span><span class="step-dot"></span></div>
-      <h1>Konfirmasi bisnis</h1>
-      <p class="sub">Server akan memverifikasi ulang bisnis ini ke Google sebelum menyimpannya.</p>
-      <div class="preview-card">
-        <div class="preview-row">
-          <div class="g-mark"></div>
-          <div style="font-weight:600;font-size:14px">${escapeHtml(state.picked.description)}</div>
-        </div>
-      </div>
-      <button class="btn-primary" id="next">Lanjut</button>
-      <button class="btn-ghost" id="back">← Cari ulang</button>
-    `;
-    document.getElementById("next").addEventListener("click", () => { state.mode = "activate-email"; render(); });
-    document.getElementById("back").addEventListener("click", () => { state.mode = "activate-search"; render(); });
     return;
   }
 
   if (state.mode === "activate-email") {
     app.innerHTML = `
       <p class="card-id">#${escapeHtml(cardId)}</p>
-      <div class="step-dots"><span class="step-dot done"></span><span class="step-dot done"></span><span class="step-dot done"></span></div>
+      <div class="step-dots"><span class="step-dot done"></span><span class="step-dot done"></span><span class="step-dot"></span></div>
       <h1>Email pemilik bisnis</h1>
       <p class="sub">Dipakai kalau nanti kamu lupa PIN — bukan untuk promosi apa pun.</p>
       ${state.error ? `<div class="error-text">${escapeHtml(state.error)}</div>` : ""}
@@ -164,7 +125,7 @@ function render() {
       <button class="btn-primary" id="next" style="margin-top:14px">Lanjut ke PIN</button>
       <button class="btn-ghost" id="back">← Kembali</button>
     `;
-    document.getElementById("back").addEventListener("click", () => { state.mode = "activate-confirm"; render(); });
+    document.getElementById("back").addEventListener("click", () => { state.mode = "activate-search"; render(); });
     document.getElementById("next").addEventListener("click", () => {
       const email = document.getElementById("email").value.trim();
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
@@ -206,7 +167,7 @@ function render() {
         try {
           const data = await api(`/api/cards/${cardId}/activate`, {
             method: "POST",
-            body: JSON.stringify({ placeId: state.picked.placeId, pin: state.pin, ownerEmail: state.email }),
+            body: JSON.stringify({ businessName: state.businessName, reviewLink: state.reviewLink, pin: state.pin, ownerEmail: state.email }),
           });
           state.card = { ...state.card, status: "active", business_name: data.businessName, review_link: data.reviewLink };
           state.mode = "activate-done";
@@ -267,8 +228,6 @@ function render() {
       try {
         await api(`/api/cards/${cardId}/verify-pin`, { method: "POST", body: JSON.stringify({ pin: v }) });
         state.mode = "edit-form";
-        state.query = state.card.business_name || "";
-        state.picked = null;
         state.newPin = "";
         render();
       } catch (e) {
@@ -288,23 +247,25 @@ function render() {
     app.innerHTML = `
       <p class="card-id">#${escapeHtml(cardId)}</p>
       <h1>Edit data kartu</h1>
-      <p class="sub">Ubah nama bisnis atau buat PIN baru (opsional).</p>
-      <div class="search-box"><input id="q" value="${escapeHtml(state.query)}" /></div>
-      <div id="results" class="autocomplete-list" style="display:none"></div>
+      <p class="sub">Ubah nama bisnis, link review, atau buat PIN baru (opsional).</p>
+      ${state.error ? `<div class="error-text">${escapeHtml(state.error)}</div>` : ""}
+      <div class="search-box" style="margin-bottom:10px"><input id="name" placeholder="Nama bisnis" value="${escapeHtml(state.card.business_name || "")}" /></div>
+      <div class="search-box"><input id="link" placeholder="Link review Google" value="${escapeHtml(state.card.review_link || "")}" /></div>
       <p class="sub" style="margin-top:14px;margin-bottom:6px">PIN baru (kosongkan jika tidak diganti)</p>
       <div id="pad">${pinPadHTML(state.newPin || "")}</div>
-      ${state.error ? `<div class="error-text">${escapeHtml(state.error)}</div>` : ""}
       <button class="btn-primary" id="save">Simpan perubahan</button>
       <button class="btn-ghost" id="cancel">← Batal</button>
     `;
-    bindAutocomplete(document.getElementById("q"), document.getElementById("results"), () => {});
     const pad = document.getElementById("pad");
     bindPinPad(pad, () => state.newPin || "", (v) => { state.newPin = v; render(); });
     document.getElementById("cancel").addEventListener("click", () => { state.mode = "active-summary"; render(); });
     document.getElementById("save").addEventListener("click", async () => {
+      const name = document.getElementById("name").value.trim();
+      const link = document.getElementById("link").value.trim();
+      if (name.length < 2) { state.error = "Nama bisnis minimal 2 karakter"; render(); return; }
+      if (!/^https:\/\//.test(link)) { state.error = "Link harus diawali https://"; render(); return; }
       try {
-        const body = { pin: state.pin };
-        if (state.picked) body.placeId = state.picked.placeId;
+        const body = { pin: state.pin, businessName: name, reviewLink: link };
         if (state.newPin && state.newPin.length === 4) body.newPin = state.newPin;
         const data = await api(`/api/cards/${cardId}/edit`, { method: "POST", body: JSON.stringify(body) });
         state.card = { ...state.card, business_name: data.businessName, review_link: data.reviewLink };
@@ -323,4 +284,12 @@ function render() {
       <div class="center">
         <div class="check-circle">✓</div>
         <h1>Perubahan disimpan</h1>
-        <p class="sub">Kartu #${escapeHtml(cardId)} sekarang tersambung ke<br><b>${escapeHtml(state.card.business_na
+        <p class="sub">Kartu #${escapeHtml(cardId)} sekarang tersambung ke<br><b>${escapeHtml(state.card.business_name)}</b>.</p>
+        <button class="btn-primary" id="ok">Selesai</button>
+      </div>`;
+    document.getElementById("ok").addEventListener("click", () => { state.mode = "active-summary"; render(); });
+    return;
+  }
+}
+
+loadCard();
