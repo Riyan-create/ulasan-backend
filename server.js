@@ -25,7 +25,6 @@ require("dotenv").config();
 
 const PORT = process.env.PORT || 3000;
 const BASE_URL = (process.env.BASE_URL || "http://localhost:3000").replace(/\/$/, "");
-const GOOGLE_PLACES_API_KEY = process.env.GOOGLE_PLACES_API_KEY;
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY;
 const FORCE_HTTPS = process.env.FORCE_HTTPS === "true";
 
@@ -33,8 +32,6 @@ const db = new Database(path.join(__dirname, "ulasin.db"));
 db.exec(fs.readFileSync(path.join(__dirname, "schema.sql"), "utf8"));
 
 // ---------- Email (untuk pemulihan PIN) ----------
-// Kalau SMTP_HOST tidak diisi (mis. saat pengembangan lokal), email tidak benar-benar
-// terkirim — link resetnya akan dicetak ke console supaya tetap bisa dites.
 const smtpConfigured = !!process.env.SMTP_HOST;
 const mailer = smtpConfigured
   ? nodemailer.createTransport({
@@ -61,7 +58,7 @@ async function sendResetEmail(toEmail, cardId, rawToken) {
 
 // ---------- App setup ----------
 const app = express();
-app.set("trust proxy", 1); // penting kalau di belakang reverse proxy (Caddy/Nginx/Railway/dst)
+app.set("trust proxy", 1);
 app.use(helmet({ contentSecurityPolicy: false, hsts: { maxAge: 31536000, includeSubDomains: true } }));
 app.use(morgan("combined"));
 app.use(express.json());
@@ -82,7 +79,6 @@ const pinLimiter = rateLimit({
   legacyHeaders: false,
   message: { ok: false, error: "Terlalu banyak percobaan, coba lagi beberapa menit lagi." },
 });
-const searchLimiter = rateLimit({ windowMs: 60 * 1000, max: 30 });
 const forgotLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 5 });
 
 // ---------- Helper ----------
@@ -124,20 +120,26 @@ async function verifyPin(cardId, pin) {
   return match ? { ok: true } : { ok: false, reason: "PIN salah" };
 }
 
-// Server TIDAK PERNAH mempercayai nama bisnis dari client. placeId selalu
-// diverifikasi ulang lewat Google Place Details, dan nama yang dipakai adalah
-// nama yang dikembalikan Google — ini menutup celah orang mengirim teks bebas
-// (termasuk HTML/script) sebagai "nama bisnis".
-async function verifyPlaceId(placeId) {
-  if (!placeId || typeof placeId !== "string") return null;
-  const url = new URL("https://maps.googleapis.com/maps/api/place/details/json");
-  url.searchParams.set("place_id", placeId);
-  url.searchParams.set("fields", "name,place_id");
-  url.searchParams.set("key", GOOGLE_PLACES_API_KEY);
-  const resp = await fetch(url);
-  const data = await resp.json();
-  if (data.status !== "OK" || !data.result) return null;
-  return { name: data.result.name, placeId: data.result.place_id };
+// MODE MANUAL (tanpa Google Places API): nama bisnis dan link review diisi
+// sendiri oleh pemilik kartu, bukan hasil pencarian otomatis.
+function sanitizeBusinessName(name) {
+  if (!name || typeof name !== "string") return null;
+  const trimmed = name.trim().replace(/[\r\n\t]+/g, " ");
+  if (trimmed.length < 2 || trimmed.length > 100) return null;
+  return trimmed;
+}
+
+function sanitizeReviewLink(link) {
+  if (!link || typeof link !== "string") return null;
+  const trimmed = link.trim();
+  if (trimmed.length > 500) return null;
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol !== "https:") return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
 }
 
 // ================= REDIRECT UTAMA (yang ditulis ke NFC/QR) =================
@@ -161,7 +163,7 @@ app.get("/reset-pin/:id", (req, res) => {
 // ================= AKTIVASI =================
 app.post("/api/cards/:id/activate", pinLimiter, async (req, res) => {
   const { id } = req.params;
-  const { placeId, pin, ownerEmail } = req.body;
+  const { businessName, reviewLink, pin, ownerEmail } = req.body;
 
   const card = getCard(id);
   if (!card) return res.status(404).json({ ok: false, error: "Kartu tidak ditemukan" });
@@ -174,23 +176,25 @@ app.post("/api/cards/:id/activate", pinLimiter, async (req, res) => {
   if (!EMAIL_RE.test(ownerEmail || "")) {
     return res.status(400).json({ ok: false, error: "Email tidak valid — dipakai untuk pemulihan PIN nanti" });
   }
-
-  const verified = await verifyPlaceId(placeId);
-  if (!verified) {
-    return res.status(400).json({ ok: false, error: "Bisnis tidak ditemukan di Google, coba cari ulang" });
+  const cleanName = sanitizeBusinessName(businessName);
+  if (!cleanName) {
+    return res.status(400).json({ ok: false, error: "Nama bisnis harus 2-100 karakter" });
+  }
+  const cleanLink = sanitizeReviewLink(reviewLink);
+  if (!cleanLink) {
+    return res.status(400).json({ ok: false, error: "Link review harus URL https:// yang valid" });
   }
 
-  const reviewLink = `https://search.google.com/local/writereview?placeid=${encodeURIComponent(verified.placeId)}`;
   const pinHash = await bcrypt.hash(pin, 10);
 
   db.prepare(
     `UPDATE cards
-     SET status = 'active', business_name = ?, place_id = ?, review_link = ?, pin_hash = ?, owner_email = ?,
+     SET status = 'active', business_name = ?, review_link = ?, pin_hash = ?, owner_email = ?,
          activated_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
      WHERE id = ?`
-  ).run(verified.name, verified.placeId, reviewLink, pinHash, ownerEmail.toLowerCase(), id);
+  ).run(cleanName, cleanLink, pinHash, ownerEmail.toLowerCase(), id);
 
-  res.json({ ok: true, businessName: verified.name, reviewLink });
+  res.json({ ok: true, businessName: cleanName, reviewLink: cleanLink });
 });
 
 // ================= VERIFIKASI PIN =================
@@ -202,22 +206,24 @@ app.post("/api/cards/:id/verify-pin", pinLimiter, async (req, res) => {
 // ================= EDIT (butuh PIN valid) =================
 app.post("/api/cards/:id/edit", pinLimiter, async (req, res) => {
   const { id } = req.params;
-  const { pin, placeId, newPin, ownerEmail } = req.body;
+  const { pin, businessName, reviewLink, newPin, ownerEmail } = req.body;
 
   const check = await verifyPin(id, pin || "");
   if (!check.ok) return res.status(401).json(check);
 
   const card = getCard(id);
-  let businessName = card.business_name;
-  let finalPlaceId = card.place_id;
-  let reviewLink = card.review_link;
+  let finalName = card.business_name;
+  let finalLink = card.review_link;
 
-  if (placeId) {
-    const verified = await verifyPlaceId(placeId);
-    if (!verified) return res.status(400).json({ ok: false, error: "Bisnis tidak ditemukan di Google" });
-    businessName = verified.name;
-    finalPlaceId = verified.placeId;
-    reviewLink = `https://search.google.com/local/writereview?placeid=${encodeURIComponent(verified.placeId)}`;
+  if (businessName) {
+    const cleanName = sanitizeBusinessName(businessName);
+    if (!cleanName) return res.status(400).json({ ok: false, error: "Nama bisnis harus 2-100 karakter" });
+    finalName = cleanName;
+  }
+  if (reviewLink) {
+    const cleanLink = sanitizeReviewLink(reviewLink);
+    if (!cleanLink) return res.status(400).json({ ok: false, error: "Link review harus URL https:// yang valid" });
+    finalLink = cleanLink;
   }
 
   if (ownerEmail && !EMAIL_RE.test(ownerEmail)) {
@@ -229,16 +235,14 @@ app.post("/api/cards/:id/edit", pinLimiter, async (req, res) => {
 
   db.prepare(
     `UPDATE cards
-     SET business_name = ?, place_id = ?, review_link = ?, pin_hash = ?, owner_email = ?, updated_at = CURRENT_TIMESTAMP
+     SET business_name = ?, review_link = ?, pin_hash = ?, owner_email = ?, updated_at = CURRENT_TIMESTAMP
      WHERE id = ?`
-  ).run(businessName, finalPlaceId, reviewLink, nextPinHash, nextEmail, id);
+  ).run(finalName, finalLink, nextPinHash, nextEmail, id);
 
-  res.json({ ok: true, businessName, reviewLink });
+  res.json({ ok: true, businessName: finalName, reviewLink: finalLink });
 });
 
 // ================= LUPA PIN =================
-// Selalu balas pesan generik yang sama, supaya orang luar tidak bisa memakai endpoint
-// ini untuk menebak email mana yang terdaftar di kartu mana (email enumeration).
 app.post("/api/cards/:id/forgot-pin", forgotLimiter, async (req, res) => {
   const { id } = req.params;
   const { email } = req.body;
@@ -289,29 +293,6 @@ app.post("/api/cards/:id/reset-pin", pinLimiter, async (req, res) => {
   res.json({ ok: true });
 });
 
-// ================= PROXY GOOGLE PLACES AUTOCOMPLETE =================
-app.get("/api/places/autocomplete", searchLimiter, async (req, res) => {
-  const q = req.query.q;
-  if (!q || q.length < 2) return res.json({ predictions: [] });
-  if (!GOOGLE_PLACES_API_KEY) {
-    return res.status(500).json({ error: "GOOGLE_PLACES_API_KEY belum diset di server" });
-  }
-  const url = new URL("https://maps.googleapis.com/maps/api/place/autocomplete/json");
-  url.searchParams.set("input", q);
-  url.searchParams.set("types", "establishment");
-  url.searchParams.set("key", GOOGLE_PLACES_API_KEY);
-
-  try {
-    const resp = await fetch(url);
-    const data = await resp.json();
-    const predictions = (data.predictions || []).map((p) => ({ description: p.description, placeId: p.place_id }));
-    res.json({ predictions });
-  } catch (err) {
-    console.error(err);
-    res.status(502).json({ error: "Gagal menghubungi Google Places" });
-  }
-});
-
 // ================= INFO KARTU =================
 app.get("/api/cards/:id", (req, res) => {
   const card = getCard(req.params.id);
@@ -320,7 +301,6 @@ app.get("/api/cards/:id", (req, res) => {
 });
 
 // ================= ADMIN (lihat semua kartu) =================
-// Lindungi dengan header:  x-admin-key: <ADMIN_API_KEY>
 app.get("/api/admin/cards", (req, res) => {
   if (!ADMIN_API_KEY || req.headers["x-admin-key"] !== ADMIN_API_KEY) {
     return res.status(401).json({ ok: false, error: "Tidak diizinkan" });
